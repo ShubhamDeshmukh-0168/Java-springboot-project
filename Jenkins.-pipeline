@@ -1,0 +1,320 @@
+pipeline {
+    agent { 
+        label "fe"
+    }
+
+    environment {
+        APP_DIR = "/home/ec2-user/front"
+        REPO_NAME = "Java-springboot-project"
+        REPO_URL = "https://github.com/ShubhamDeshmukh-0168/Java-springboot-project.git"
+        FRONTEND_DIR = "/home/ec2-user/front/Java-springboot-project/frontend"
+    }
+
+    stages {
+
+        stage('Prepare Environment') {
+            steps {
+                sh '''
+                echo "🚀 Preparing EC2 Node..."
+
+                sudo dnf install -y python3 python3-pip git || true
+
+                mkdir -p $APP_DIR
+                '''
+            }
+        }
+
+        stage('Clone or Pull Code') {
+            steps {
+                sh '''
+                cd $APP_DIR
+
+                if [ -d "$REPO_NAME/.git" ]; then
+                  echo "📥 Pulling latest code..."
+                  cd $REPO_NAME
+                  git reset --hard
+                  git pull origin main
+                else
+                  echo "📦 Cloning repository..."
+                  git clone $REPO_URL
+                  cd $REPO_NAME
+                fi
+                '''
+            }
+        }
+
+        stage('Setup Python Environment') {
+            steps {
+                sh '''
+                cd $FRONTEND_DIR
+
+                echo "🐍 Setting up virtual environment..."
+
+                if [ ! -d "venv" ]; then
+                  python3 -m venv venv
+                fi
+
+                source venv/bin/activate
+
+                pip install --upgrade pip
+                pip install -r requirements.txt
+                '''
+            }
+        }
+
+        stage('Setup systemd Service') {
+            steps {
+                sh '''
+                echo "⚙️ Configuring systemd service..."
+
+                sudo tee /etc/systemd/system/frontend.service > /dev/null <<EOF
+[Unit]
+Description=Streamlit Frontend App
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=$FRONTEND_DIR
+
+ExecStart=/bin/bash -c 'source $FRONTEND_DIR/venv/bin/activate && streamlit run app.py --server.port=8501 --server.address=0.0.0.0'
+
+Environment=API_URL=http://3.80.169.121:8084  #backend IP
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/home/ec2-user/frontend.log
+StandardError=append:/home/ec2-user/frontend-error.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+                sudo systemctl daemon-reload
+                sudo systemctl enable frontend
+                '''
+            }
+        }
+
+        stage('Restart Frontend Service') {
+            steps {
+                sh '''
+                echo "🔄 Restarting frontend service..."
+
+                sudo systemctl restart frontend
+
+                sleep 10
+
+                sudo systemctl status frontend --no-pager
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                echo "🔍 Checking frontend health..."
+
+                for i in {1..10}; do
+                  RESPONSE=$(curl -s http://54.167.222.222:8501 || true) #frontend IP
+
+                  if [[ -n "$RESPONSE" ]]; then
+                    echo "✅ Frontend is UP"
+                    exit 0
+                  fi
+
+                  echo "⏳ Waiting..."
+                  sleep 5
+                done
+
+                echo "❌ Frontend failed to start"
+
+                echo "📜 Logs:"
+                tail -n 50 /home/ec2-user/frontend-error.log
+
+                exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 Frontend Deployment Successful"
+        }
+        failure {
+            echo "❌ Frontend Deployment Failed"
+        }
+    }
+}
+####################backend-pipeline#########################################
+#db_host,db_username,db_password, add this Credentials inside jenkins>>Credentials
+
+
+
+pipeline {
+    agent { 
+        label "be"
+    }  
+
+    environment {
+        APP_DIR = "/home/ec2-user/app"
+        REPO_NAME = "Java-springboot-project"
+        REPO_URL = "https://github.com/ShubhamDeshmukh-0168/Java-springboot-project.git"
+        LOG_DIR = "/var/log/app"
+        PORT = "8084"
+    }
+
+    stages {
+
+        stage('Prepare Environment') {
+            steps {
+                sh '''
+                echo "🚀 Preparing EC2 Node..."
+
+                sudo yum install -y git maven java-17-amazon-corretto || true
+
+                mkdir -p $APP_DIR
+                sudo mkdir -p $LOG_DIR
+                sudo chown ec2-user:ec2-user $LOG_DIR
+                '''
+            }
+        }
+
+        stage('Clone or Pull Code') {
+            steps {
+                sh '''
+                cd $APP_DIR
+
+                if [ -d "$REPO_NAME/.git" ]; then
+                  echo "📥 Pulling latest code..."
+                  cd $REPO_NAME
+                  git reset --hard
+                  git pull origin main
+                else
+                  echo "📦 Cloning repository..."
+                  git clone $REPO_URL
+                  cd $REPO_NAME
+                fi
+                '''
+            }
+        }
+
+        stage('Build Application') {
+            steps {
+                sh '''
+                echo "⚙️ Building application..."
+                cd $APP_DIR/$REPO_NAME/backend
+
+                # Reduce memory usage (prevents EC2 crash)
+                export MAVEN_OPTS="-Xmx512m"
+
+                mvn clean package -DskipTests -U
+                '''
+            }
+        }
+
+        stage('Stop Old Application') {
+            steps {
+                sh '''
+                echo "🛑 Stopping old application..."
+
+                PIDS=$(pgrep -f "java.*\\.jar" || true)
+
+                if [ -n "$PIDS" ]; then
+                  echo "Killing PIDs: $PIDS"
+                  kill $PIDS || true
+                  sleep 5
+
+                  for PID in $PIDS; do
+                    if ps -p $PID > /dev/null; then
+                      echo "Force killing $PID"
+                      kill -9 $PID || true
+                    fi
+                  done
+                else
+                  echo "No running app found"
+                fi
+                '''
+            }
+        }
+
+        stage('Start Application') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'db_host', variable: 'DB_HOST'),
+                    string(credentialsId: 'db_username', variable: 'DB_USERNAME'),
+                    string(credentialsId: 'db_password', variable: 'DB_PASSWORD')
+                ]) {
+                    sh '''
+                    echo "🚀 Starting application..."
+
+                    cd $APP_DIR/$REPO_NAME/backend/target
+
+                    echo "📦 Available JARs:"
+                    ls -l *.jar
+
+                    JAR_FILE=$(ls *.jar | head -n 1)
+                    echo "Using JAR: $JAR_FILE"
+
+                    nohup env \
+                      MYSQL_HOST=$DB_HOST \
+                      MYSQL_PORT=3306 \
+                      MYSQL_USERNAME=$DB_USERNAME \
+                      MYSQL_PASSWORD=$DB_PASSWORD \
+                      LOG_FILE_PATH=$LOG_DIR/datastore.log \
+                      java -Xmx512m -jar $JAR_FILE \
+                      --server.port=$PORT \
+                      --server.address=0.0.0.0 \
+                      > $LOG_DIR/nohup.out 2>&1 &
+
+                    sleep 10
+
+                    echo "📜 Startup logs:"
+                    tail -n 30 $LOG_DIR/nohup.out
+                    '''
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                echo "⏳ Waiting for app..."
+
+                for i in {1..12}; do
+                  echo "Attempt $i..."
+
+                  HEALTH=$(curl -s http://localhost:$PORT/actuator/health || true)
+
+                  echo "Health: $HEALTH"
+                  if [[ "$HEALTH" == *'"status":"UP"'* ]]; then
+                    echo "✅ Application is UP"
+                    exit 0
+                  fi
+
+                  sleep 10
+                done
+
+                echo "❌ App failed to start"
+
+                echo "📜 Logs:"
+                tail -n 100 $LOG_DIR/nohup.out
+
+                exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 Deployment Successful"
+        }
+        failure {
+            echo "❌ Deployment Failed"
+        }
+    }
+}
+#while backend pipeline run time backend node connection may be bracke os connect it immediately 
+
